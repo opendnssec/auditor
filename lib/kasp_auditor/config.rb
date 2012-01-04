@@ -30,34 +30,62 @@ module KASPAuditor
   # Represents KASP configuration file
   # Also loads salt in from <zone_config>.xml SignerConfiguration file.
   class Config
+    class ConfigLoadError < Exception
+    end
+
     attr_reader :err
+    attr_accessor :changed_config
+    
+    # Should the PartialAuditor be used instead of the full Auditor?
+    attr_reader :partial_audit
     def initialize(zone_name, kasp_file_loc, policy, config_file_loc, syslog)
+      return if !zone_name
       #      @zones = []
       #      print "Opening config file : #{config_file_loc}\n"
       # Read the kasp.xml file
       @name = (zone_name.to_s+"").untaint
       @err = 0
+      @partial_audit = false
       begin
         File.open((kasp_file_loc+"").untaint, 'r') {|file|
           doc = REXML::Document.new(file)
 
+
           # Now find the appropiate policy
+          found_policy = false
           doc.elements.each('KASP/Policy') {|p|
             if (p.attributes['name'] == policy)
+              found_policy = true
               # Now load the policy in!
           
               # @TODO@ Check out Zone.SOA - should be able to monitor SOA with that
 
               #        # Fill out new zone
-              @signatures = Signatures.new(p.elements['Signatures'])
-              @denial = Denial.new(p.elements['Denial'])
-              @keys = Keys.new(p.elements['Keys'])
-              @soa = SOA.new(p.elements['Zone/SOA'])
+              @audit_tag_present = false
+              p.elements.each('Audit') {|a|
+                # Read the information present in the Audit element, and
+                # figure out what sort of auditor to use - full or partial
+                @audit_tag_present = true
+                a.elements.each('Partial') {|partial|
+                  @partial_audit = true
+                }
+              }
+              begin
+                @signatures = Signatures.new(p.elements['Signatures'])
+                @denial = Denial.new(p.elements['Denial'])
+                @keys = Keys.new(p.elements['Keys'])
+                @soa = SOA.new(p.elements['Zone/SOA'])
+              rescue Exception => e
+                raise ConfigLoadError.new("ERROR - Configuration file #{kasp_file_loc} can't be loaded. Try running ods-kaspcheck to check the configuration.")
+              end
             end
           }
+          if (!found_policy)
+            raise ConfigLoadError.new("ERROR - Can't find policy #{policy.inspect} in KASP Policy.")
+          end
         }
-      rescue Errno::ENOENT
-        KASPAuditor.exit("ERROR - Can't find KASP file : #{kasp_file_loc}", 1)
+      rescue Exception => e
+        raise ConfigLoadError.new("ERROR - Can't find KASP file : #{kasp_file_loc.inspect} : #{e}")
       end
       #
       # Read the salt ONLY from the SignerConfiguration
@@ -68,9 +96,11 @@ module KASPAuditor
             doc = REXML::Document.new(file)
             e = doc.elements['SignerConfiguration/Zone/Denial/NSEC3/Hash/']
             if (e)
-              @denial.nsec3.hash.salt = Dnsruby::RR::NSEC3.decode_salt(e.elements['Salt'].text)
-              if (@denial.nsec3.hash.salt.length.to_i != @denial.nsec3.hash.salt_length.to_i)
-                msg = "ERROR : SALT LENGTH IS #{@denial.nsec3.hash.salt.length}, but should be #{@denial.nsec3.hash.salt_length}"
+              @denial.nsec3.hash.salt = e.elements['Salt'].text
+              decoded_salt = Dnsruby::RR::NSEC3.decode_salt(@denial.nsec3.hash.salt)
+              if (decoded_salt.length.to_i != @denial.nsec3.hash.salt_length.to_i)
+                # @TODO@ Only log this if this is a zone of interest!
+                msg = "ERROR : SALT LENGTH IS #{decoded_salt.length}, but should be #{@denial.nsec3.hash.salt_length}"
                 print "#{Syslog::LOG_ERR}: #{msg}\n"
                 begin
                   syslog.log(Syslog::LOG_ERR, msg)
@@ -79,11 +109,11 @@ module KASPAuditor
                 @err = Syslog::LOG_ERR
               end
             else
-              KASPAuditor.exit("ERROR - can't read salt from SignerConfiguration file : #{conf_f}")
+              raise ConfigLoadError.new("ERROR - can't read salt from SignerConfiguration file : #{conf_f}")
             end
           }
         rescue Errno::ENOENT
-          KASPAuditor.exit("ERROR - Can't find SignerConfiguration file : #{conf_f}", 1)
+          raise ConfigLoadError.new("ERROR - Can't find SignerConfiguration file : #{conf_f}")
         end
       end
     end
@@ -95,7 +125,9 @@ module KASPAuditor
       if (@denial.nsec3)
         @keys.keys.each {|key|
           if ((key.algorithm != Dnsruby::Algorithms.DSA_NSEC3_SHA1) &&
-                (key.algorithm != Dnsruby::Algorithms.RSASHA1_NSEC3_SHA1))
+                (key.algorithm != Dnsruby::Algorithms.RSASHA1_NSEC3_SHA1) &&
+                (key.algorithm != Dnsruby::Algorithms.RSASHA256) &&
+                (key.algorithm != Dnsruby::Algorithms.RSASHA512))
             return true
           end
         }
@@ -111,14 +143,14 @@ module KASPAuditor
       from_min = 0 | a.min * 60
       from_hour = 0 | a.hour * 60 * 60
       from_day = 0 | a.day * 60 * 60 * 24
-      from_month = 0 | a.month * 60 * 60 * 24 * 30
-      from_year = 0 | a.year * 60 * 60 * 24 * 30 * 12
+      from_month = 0 | a.month * 60 * 60 * 24 * 31
+      from_year = 0 | a.year * 60 * 60 * 24 * 365
       # XSD::XSDDuration seconds hack.
       x = a.sec.to_s.to_i + from_min + from_hour + from_day + from_month + from_year
       return x
     end
 
-    attr_accessor :name, :signatures, :keys, :denial, :soa
+    attr_accessor :name, :signatures, :keys, :denial, :soa, :audit_tag_present
         
     class Signatures
       attr_accessor :resign, :refresh, :jitter, :inception_offset, :validity
@@ -215,12 +247,22 @@ module KASPAuditor
         }
       end
       class AnyKey
-        attr_accessor :algorithm, :alg_length
+        attr_accessor :algorithm, :alg_length, :standby, :lifetime
         def initialize(e)
           # Algorithm length and value
           @algorithm = Dnsruby::Algorithms.new(e.elements['Algorithm'].text.to_i)
+          begin
+            @standby = e.elements['Standby'].text.to_i
+          rescue Exception
+            @standby = 0
+          end
+          lifetime_text = e.elements['Lifetime'].text
+          @lifetime = Config.xsd_duration_to_seconds(lifetime_text)
+          if (@lifetime == 0)
+            @lifetime = 999999999999
+          end
           e.elements.each('Algorithm') {|s|
-            @alg_length = s.attributes['length']
+            @alg_length = s.attributes['length'].to_i
           }
         end
       end

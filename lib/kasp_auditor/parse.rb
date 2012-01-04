@@ -1,5 +1,3 @@
-#!/usr/bin/env ruby
-#
 # $Id$
 #
 # Copyright (c) 2009 Nominet UK. All rights reserved.
@@ -31,7 +29,8 @@ include REXML
 
 module KASPAuditor
   class Parse
-    def self.parse(path, zonelist_filename, kasp_filename, syslog)
+    def self.parse(path, zonelist_filename, kasp_filename, syslog, conf_file,
+        working_folder, zone)
       # We need to open [/etc/opendnssec/]conf.xml,
       #                 [/etc/opendnssec/]kasp.xml,
       #                 [/etc/opendnssec/]zonelist.xml
@@ -49,27 +48,37 @@ module KASPAuditor
         doc = REXML::Document.new(file)
         doc.elements.each("ZoneList/Zone") {|z|
           # First load the config files
-          zone_name = z.attributes['name']
+          zone_name = z.attributes['name'].chomp(".")
+          if (zone) # We're only asked to load a single zone
+            next if (zone_name.downcase != zone.downcase) # So don't bother loading any other zones
+          end
           policy = z.elements['Policy'].text
 
           config_file_loc = z.elements["SignerConfiguration"].text
-          if (config_file_loc.index("/") != 0)
+          if (config_file_loc.index(File::SEPARATOR) != 0)
             config_file_loc = path + config_file_loc
           end
 
           # Now parse the config file
-          config = Config.new(zone_name, kasp_filename, policy,
-            config_file_loc, syslog)
+          begin
+            config = Config.new(zone_name, kasp_filename, policy,
+              config_file_loc, syslog)
 
-          input_file_loc = z.elements["Adapters"].elements['Input'].elements["File"].text
-          if (input_file_loc.index("/") != 0)
-            input_file_loc = path + input_file_loc
+            output_file_loc = z.elements["Adapters"].elements['Output'].elements["File"].text
+            if (output_file_loc.index(File::SEPARATOR) != 0)
+              output_file_loc = path + output_file_loc
+            end
+            zones.push([config, output_file_loc])
+
+            # Load the config elements storage file, and keep a note of which elements have changed, and when they last changed.
+            changed_config = ChangedConfig.new(zone_name, conf_file, kasp_filename, config, working_folder, syslog)
+            config.changed_config = changed_config
+
+          rescue Config::ConfigLoadError => e
+            msg = "Can't load #{zone_name} SignerConfiguration file (#{config_file_loc}) : #{e}"
+            print msg+"\n"
+            syslog.log(LOG_ERR, msg)
           end
-          output_file_loc = z.elements["Adapters"].elements['Output'].elements["File"].text
-          if (output_file_loc.index("/") != 0)
-            output_file_loc = path + output_file_loc
-          end
-          zones.push([config, input_file_loc, output_file_loc])
         }
       }
       return zones

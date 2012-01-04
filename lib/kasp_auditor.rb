@@ -25,14 +25,24 @@
 # IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-require 'rubygems'
+require 'etc'
+begin
+  require 'dnsruby'
+rescue LoadError
+  require 'rubygems'
+  require 'dnsruby'
+end
 require 'syslog'
 include Syslog::Constants
+include Dnsruby
+require 'kasp_auditor/commands.rb'
 require 'kasp_auditor/config.rb'
+require 'kasp_auditor/changed_config.rb'
+require 'kasp_auditor/key_tracker.rb'
 require 'kasp_auditor/auditor.rb'
+require 'kasp_auditor/partial_auditor.rb'
 require 'kasp_auditor/parse.rb'
 require 'kasp_auditor/preparser.rb'
-require 'kasp_auditor/auditor_daemon.rb'
 
 # This module provides auditing capabilities to OpenDNSSEC.
 # Once an unsigned zone has been signed, this module is used to check that
@@ -42,69 +52,105 @@ require 'kasp_auditor/auditor_daemon.rb'
 # Several transient files are created during this process - they are removed
 # when the process is complete.
 module KASPAuditor
+  # Make sure that the "sort" command works uniformly across platforms
   ENV['LC_ALL']= "C"
 
-  def KASPAuditor.exit(msg, err)
-    # @TODO@ Log exit msg
+  # Give up - all is lost
+  def KASPAuditor.exit(msg, err, log = nil)
+    if (log)
+      log.log(LOG_ERR, msg)
+    end
     print msg + "\n"
     Kernel.exit(err)
   end
   $SAFE = 1
+
   # The KASPAuditor takes the signed and unsigned zones and compares them.
   # It first parses both files, and creates transient files which are then
   # sorted into canonical order. These files are then processed by the
   # Auditor. If processing an NSEC3-signed file, the Auditor will create
   # additional temporary files, which are processed after the main auditing
-  # run.
+  # run. This class controls the process.
   class Runner
 
-    attr_accessor :kasp_file, :zone_name, :signed_temp, :conf_file
+    attr_accessor :kasp_file, :zone_name, :signed_temp, :unsigned_zone
+    attr_accessor :enable_timeshift, :conf_file
+    
+    # This the default value for the working folders, which is only used if the XML config can't be found
+    attr_accessor :working_folder
+
+    def force_partial
+      @force_partial = true
+      if (@force_partial && @force_full)
+        raise ArgumentError.new("Can't force both full and partial auditor at once")
+      end
+    end
+
+    def force_full
+      @force_full = true
+      if (@force_full && @force_partial)
+        raise ArgumentError.new("Can't force both full and partial auditor at once")
+      end
+    end
+
+    def initialize
+      @enable_timeshift = false
+    end
 
     # Run the auditor.
     def run
       conf_file = @conf_file
+      @zone_name.chomp(".")
       if (!conf_file)
         KASPAuditor.exit("No configuration file specified", 1)
       end
-      syslog_facility, working, zonelist, kasp_file = load_config_xml(conf_file)
+      syslog_facility, working, signer_working_folder, zonelist, kasp_file, enforcer_interval =
+        load_config_xml(conf_file)
       if (@kasp_file)
         kasp_file = @kasp_file
       end
 
-      Syslog.open("kasp_auditor", Syslog::LOG_PID | Syslog::LOG_CONS, syslog_facility) { |syslog| run_with_syslog(zonelist, kasp_file, syslog, working)
+      Syslog.open("ods-auditor", Syslog::LOG_PID |
+        Syslog::LOG_CONS, syslog_facility) { |syslog|
+        run_with_syslog(zonelist, kasp_file, syslog, working, 
+          signer_working_folder, enforcer_interval, conf_file)
       }
     end
 
-    def run_as_daemon
-      daemon = AuditorDaemon.new
-      daemon.conf_file = @conf_file
-      if (@kasp_file)
-        daemon.kasp_file = @kasp_file
-      end
-      if (@zone_name)
-        daemon.zone_name = @zone_name
-        if (@signed_temp)
-          daemon.signed_temp = @signed_temp
-        end
-      end
-      daemon.run
-    end
-
     # This method is provided so that the test code can use its own syslog
-    def run_with_syslog(zonelist_file, kasp_file, syslog, working) # :nodoc: all
-      zones = Parse.parse(File.dirname(kasp_file)  + "/", zonelist_file, kasp_file, syslog)
-      check_zones_to_audit(zones)
+    def run_with_syslog(zonelist_file, kasp_file, syslog, 
+        working, signer_working_folder, enforcer_interval, conf_file) # :nodoc: all
+      syslog.log(LOG_INFO, "Auditor started")
+      print("Auditor started\n")
+      if (@enable_timeshift)
+        configure_timeshift(syslog)
+      end
+      zones = nil
+      begin
+        zones = Parse.parse(File.dirname(kasp_file)  + File::SEPARATOR,
+          zonelist_file, kasp_file, syslog, conf_file, working, @zone_name)
+      rescue Exception => e
+        KASPAuditor.exit("Couldn't load configuration files (from #{kasp_file}) - try running ods-kaspcheck. #{e}", -LOG_ERR, syslog)
+      end
+      zones = check_zones_to_audit(zones, syslog)
       # Now check the input and output zones using the config
       if (zones.length == 0)
-        syslog.log(LOG_ERR, "Couldn't find any zones to load")
-        KASPAuditor.exit("Couldn't find any zones to load", -LOG_ERR)
+        KASPAuditor.exit("Couldn't find any zones to load", -LOG_ERR, syslog)
       end
       pid = Process.pid
       ret = 999 # Return value to controlling process
-      zones.each {|config, input_file, output_file|
+      zones.each {|config, output_file|
+        next if !config
+        syslog.log(LOG_INFO, "Auditor starting on #{config.name}")
+        print("Auditor starting on #{config.name}\n")
+        # Override this with @unsigned_zone if present
+        input_file = signer_working_folder + File::Separator + config.name + ".inbound"
+        if ((@zone_name == config.name) && (@unsigned_zone))
+          input_file = @unsigned_zone
+        end
         do_audit = true
-        [{input_file, "Unsigned"}, {output_file, "Signed"}].each {|set|
-          set.each {|f, text|
+        [{input_file => "Unsigned"}, {output_file => "Signed"}].each {|hash|
+          hash.each {|f, text|
             if (!(File.exist?((f.to_s+"").untaint)))
               msg = "#{text} file #{f} does not exist"
               print(msg+"\n")
@@ -116,39 +162,14 @@ module KASPAuditor
         }
 
         if (do_audit)
-          # PREPARSE THE INPUT AND OUTPUT FILES!!!
-          pp = Preparser.new()
-          pids=[]
-          new_pid = normalise_and_sort(input_file, "in", pid, working, pp)
-          pids.push(new_pid)
-          new_pid = normalise_and_sort(output_file, "out", pid, working, pp)
-          pids.push(new_pid)
-          pids.each {|id|
-            ret_id, ret_status = Process.wait2(id)
-            if (ret_status != 0)
-              syslog.log(LOG_ERR, "Error sorting files (#{input_file} and #{output_file}) : ERR #{ret_status}- moving on to next zone")
-              ret = 1
-              do_audit = false
-            end
-          }
-          if (do_audit)
-            # Now audit the pre-parsed and sorted file
-            auditor = Auditor.new(syslog, working)
-            ret_val = auditor.check_zone(config, working+get_name(input_file)+".in.sorted.#{pid}",
-              working + get_name(output_file)+".out.sorted.#{pid}",
-              input_file, output_file)
-            ret = ret_val if (ret_val < ret)
-            if ((config.err > 0) && (config.err < ret))
-              ret = config.err
-            end
+          if ((config.partial_audit && !@force_full) || @force_partial)
+            ret = partial_audit(ret, input_file, output_file, working, config, syslog, enforcer_interval)
+          else
+            ret = full_audit(ret, input_file, output_file, pid, working, config, syslog, enforcer_interval)
           end
-          [input_file + ".in", output_file + ".out"].each {|f|
-            delete_file(working + get_name(f)+".parsed.#{pid}")
-            delete_file(working + get_name(f)+".sorted.#{pid}")
-          }
         end
       }
-      ret = 0 if (ret == -99)
+      ret = 0 if (ret == 999)
       ret = 0 if (ret >= LOG_WARNING) # Only return an error if LOG_ERR or above was raised
       if (ret == 0)
         print "Auditor found no errors\n"
@@ -157,8 +178,63 @@ module KASPAuditor
       end
       exit(ret)
     end
+    
+    # Invoke the partial auditor
+    def partial_audit(ret, input_file, output_file, working, config, syslog, enforcer_interval)
+      auditor = PartialAuditor.new(syslog, working)
+      ret_val = auditor.check_zone(config, input_file, output_file, enforcer_interval)
+      ret = ret_val if (ret_val < ret)
+      if ((config.err > 0) && (config.err < ret))
+        ret = config.err
+      end
+      return ret
+    end
 
-    def normalise_and_sort(f, prefix, pid, working, pp)
+    # Invoked the full auditor
+    def full_audit(ret, input_file, output_file, pid, working, config, syslog, enforcer_interval)
+      # Perform a full audit of every record. This requires sorting the zones canonically.
+      # Preparse the input and output files
+      do_audit = true
+      pids=[]
+      new_pid = normalise_and_sort(input_file, "in", pid, working, config)
+      pids.push(new_pid)
+      new_pid = normalise_and_sort(output_file, "out", pid, working, config)
+      pids.push(new_pid)
+      pids.each {|id|
+        ret_id, ret_status = Process.wait2(id)
+        if (ret_status != 0)
+          syslog.log(LOG_ERR, "Error sorting files (#{input_file} and #{output_file}) : ERR #{ret_status}- moving on to next zone")
+          ret = 1
+          do_audit = false
+        end
+      }
+      begin
+        if (do_audit)
+          # Now audit the pre-parsed and sorted file
+          auditor = Auditor.new(syslog, working, enforcer_interval)
+          ret_val = auditor.check_zone(config, working+get_name(input_file)+".in.sorted.#{pid}",
+            working + get_name(output_file)+".out.sorted.#{pid}",
+            input_file, output_file)
+          ret = ret_val if (ret_val < ret)
+          if ((config.err > 0) && (config.err < ret))
+            ret = config.err
+          end
+        end
+      rescue Exception=> e
+        syslog.log(LOG_ERR, "Unexpected error auditing files (#{input_file} and #{output_file}) : ERR #{e}- moving on to next zone. Trace for debugging : #{e.backtrace.join("\n")}")
+        ret = 1
+      ensure
+        [input_file + ".in", output_file + ".out"].each {|f|
+          delete_file(working + get_name(f)+".parsed.#{pid}")
+          delete_file(working + get_name(f)+".sorted.#{pid}")
+        }
+      end
+      return ret
+    end
+
+    # Prepare the input unsigned and signed files for auditing
+    def normalise_and_sort(f, prefix, pid, working, config)
+      pp = Preparser.new(config)
       parsed_file = working+get_name(f)+".#{prefix}.parsed.#{pid}"
       sorted_file = working+get_name(f)+".#{prefix}.sorted.#{pid}"
       delete_file(parsed_file)
@@ -175,27 +251,64 @@ module KASPAuditor
       a = f.split(File::SEPARATOR)
       return File::SEPARATOR + a[a.length()-1]
     end
+    
+    def Runner.timeshift
+      return @@timeshift
+    end
+
+    def configure_timeshift(syslog)
+      # Frig Time.now to ENV['ENFORCER_TIMESHIFT']
+      if (@enable_timeshift)
+        timeshift = ENV['ENFORCER_TIMESHIFT']
+
+        # If environment variable not present, then ignore
+        if (timeshift)
+          # Change the time
+          year = timeshift[0,4]
+          mon = timeshift[4,2]
+          day = timeshift[6,2]
+          hour = timeshift[8,2]
+          min = timeshift[10,2]
+          sec = timeshift[12,2]
+
+          syslog.log(LOG_INFO, "Timeshifting to #{timeshift}\n")
+          print "Timeshifting to #{timeshift}\n"
+
+          @@timeshift = Time.mktime(year, mon, day, hour, min, sec).to_i
+          require 'time_shift.rb'
+        end
+      end
+    end
 
     # Given a list of configured zones, and a list of zones_to_audit, return
     # only those configured zones which are in the list of zones_to_audit.
     # Ignore a trailing dot.
-    def check_zones_to_audit(zones) # :nodoc: all
+    def check_zones_to_audit(zones, syslog) # :nodoc: all
       # If @zone_name is present, then only check that zone
       if @zone_name
+        to_keep = nil
         zones.each {|z|
-          if (z[0].name != @zone_name)
-            zones.delete(z)
+          if (z[0].name.downcase == @zone_name.to_s.downcase)
+            to_keep = z
           end
         }
-        if (zones.length == 0)
-          KASPAuditor.exit("Can't find #{@zone} zone in zonelist", 1)
+        if (!to_keep)
+          KASPAuditor.exit("Can't find #{@zone_name} zone in zonelist", 1, syslog)
         end
-        if (@signed_temp)
-          # Then, if @signed is also present, then use that name for the
-          # signed zonefile.
-          zones[0][2] = @signed_temp
-        end
+        zones = [to_keep]
       end
+      if (@signed_temp)
+        # Then, if @signed is also present, then use that name for the
+        # signed zonefile.
+        conf = nil
+        zones.each {|array|
+          if (array[0].name.downcase == @zone_name.to_s.downcase)
+            conf = array[0]
+          end
+        }
+        zones=[[conf, @signed_temp]]
+      end
+      return zones
     end
 
 
@@ -207,15 +320,28 @@ module KASPAuditor
     # Returns Syslog::LOG_DAEMON on any error
     def load_config_xml(conf_file) # :nodoc: all
       working = ""
+      signer_working = ""
       zonelist = ""
       kasp = ""
       begin
         File.open((conf_file + "").untaint , 'r') {|file|
           doc = REXML::Document.new(file)
+          enforcer_interval = nil
+          begin
+            e_i_text = doc.elements['Configuration/Enforcer/Interval'].text
+            enforcer_interval = Config.xsd_duration_to_seconds(e_i_text)
+          rescue Exception
+            KASPAuditor.exit("Can't read Enforcer->Interval from Configuration", 1)
+          end
           begin
             working = doc.elements['Configuration/Auditor/WorkingDirectory'].text
           rescue Exception
-            KASPAuditor.exit("Can't read working directory from conf.xml - exiting", 1)
+            working = @working_folder
+          end
+          begin
+            signer_working = doc.elements['Configuration/Signer/WorkingDirectory'].text
+          rescue Exception
+            signer_working = @working_folder
           end
           begin
             zonelist = doc.elements['Configuration/Common/ZoneListFile'].text
@@ -232,10 +358,10 @@ module KASPAuditor
             facility = doc.elements['Configuration/Common/Logging/Syslog/Facility'].text
             # Now turn the facility string into a Syslog::Constants format....
             syslog_facility = eval "Syslog::LOG_" + (facility.upcase+"").untaint
-            return syslog_facility, working, zonelist, kasp
+            return syslog_facility, working, signer_working, zonelist, kasp, enforcer_interval
           rescue Exception => e
             print "Error reading config : #{e}\n"
-            return Syslog::LOG_DAEMON, working, zonelist,kasp
+            return Syslog::LOG_DAEMON, working, signer_working, zonelist,kasp, enforcer_interval
           end
         }
       rescue Errno::ENOENT
@@ -257,6 +383,25 @@ module KASPAuditor
       Process::Sys.setgid(gid)
     end
 
+    def change_privilege(user, group)
+      return if !user && !group
+      begin
+        uid, gid = Process.euid, Process.egid
+        target_uid = Etc.getpwnam((user+"").untaint).uid if user
+        target_gid = Etc.getgrnam((group+"").untaint).gid if group
+
+        if uid != target_uid or gid != target_gid
+          Process.initgroups(user, target_gid) if target_gid
+
+          Process::GID.change_privilege(target_gid) if target_gid
+
+          Process::UID.change_privilege(target_uid) if target_uid
+        end
+      rescue Exception => e
+        KASPAuditor.exit("Couldn't set User, Group to #{user.inspect}, #{group.inspect} : (#{e})", 1)
+      end
+    end
+
     def load_privileges(doc)
       # Configuration/Privileges may be overridden by Auditor/Privileges
       #begin
@@ -268,24 +413,18 @@ module KASPAuditor
       #rescue Exception => e
       #  print "Couldn't set Configuration/Privileges/Directory (#{e})\n"
       #end
-      begin
-        if (doc.elements['Configuration/Auditor/Privileges/User'])
-          change_uid(doc.elements['Configuration/Auditor/Privileges/User'].text)
-        elsif (doc.elements['Configuration/Privileges/User'])
-          change_uid(doc.elements['Configuration/Privileges/User'].text)
-        end
-      rescue Exception => e
-        print "Couldn't set Configuration/Privileges/User (#{e})\n"
+      user, group = nil
+      if (doc.elements['Configuration/Auditor/Privileges/Group'])
+        group=(doc.elements['Configuration/Auditor/Privileges/Group'].text)
+      elsif (doc.elements['Configuration/Privileges/Group'])
+        group=(doc.elements['Configuration/Privileges/Group'].text)
       end
-      begin
-        if (doc.elements['Configuration/Auditor/Privileges/Group'])
-          change_group(doc.elements['Configuration/Auditor/Privileges/Group'].text)
-        elsif (doc.elements['Configuration/Privileges/Group'])
-          change_group(doc.elements['Configuration/Privileges/Group'].text)
-        end
-      rescue Exception => e
-        print "Couldn't set Configuration/Privileges/Group (#{e})\n"
+      if (doc.elements['Configuration/Auditor/Privileges/User'])
+        user=(doc.elements['Configuration/Auditor/Privileges/User'].text)
+      elsif (doc.elements['Configuration/Privileges/User'])
+        user=(doc.elements['Configuration/Privileges/User'].text)
       end
+      change_privilege(user, group)
     end
 
     def delete_file(f) # :nodoc: all
@@ -296,12 +435,6 @@ module KASPAuditor
       end
     end
 
-  end
-  class KASPTime # :nodoc: all
-    # This allows the test code to frig the system time to use old test data.
-    def KASPTime.get_current_time
-      return Time.now.to_i
-    end
   end
 
 end

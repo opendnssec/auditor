@@ -10,10 +10,10 @@
 			<Resign>PT60S</Resign>
 			<Refresh>PT120S</Refresh>
 			<Validity>
-					<Default>PT24H</Default>
-					<Denial>P14D</Denial>
+					<Default>P200D</Default>
+					<Denial>P200D</Denial>
 			</Validity>
-			<Jitter>PT60S</Jitter>
+			<Jitter>P5D</Jitter>
 			<InceptionOffset>-PT300S</InceptionOffset>
 		</Signatures>
 
@@ -24,7 +24,7 @@
 				<Hash>
 					<Algorithm>1</Algorithm>
 					<Iterations>5</Iterations>
-					<Salt length="4"/>
+					<Salt length="2"/>
 				</Hash>
 			</NSEC3>
 		</Denial>
@@ -36,18 +36,18 @@
 			<ShareKeys>true</ShareKeys>
 			<!-- Parameters that are different for zsks and ksks -->
 			<KSK>
-				<Algorithm length="2048">5</Algorithm>
+				<Algorithm length="2048">7</Algorithm>
 				<Lifetime>P1Y</Lifetime>
 				<Repository>softHSM</Repository>
-				<Emergency>2</Emergency>
+				<Standby>0</Standby>
 				<RFC5011/>
 			</KSK>
 
 			<ZSK>
-				<Algorithm length="1024">5</Algorithm>
+				<Algorithm length="1024">7</Algorithm>
 				<Lifetime>P14D</Lifetime>
 				<Repository>softHSM</Repository>
-				<Emergency>2</Emergency>
+				<Standby>0</Standby>
 			</ZSK>
 		</Keys>
 
