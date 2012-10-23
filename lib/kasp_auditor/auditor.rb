@@ -583,7 +583,7 @@ module KASPAuditor
       end
       #      end
       # Check that the NSEC3PARAMs are the same as those defined in the Config
-      if (l_rr.salt != @config.denial.nsec3.hash.salt)
+      if (l_rr.salt.downcase != @config.denial.nsec3.hash.salt.downcase)
         log(LOG_ERR, "NSEC3PARAM has wrong salt : should be #{@config.denial.nsec3.hash.salt} but was #{(l_rr.salt)}")
       end
       if (l_rr.iterations != @config.denial.nsec3.hash.iterations)
@@ -607,7 +607,7 @@ module KASPAuditor
         @first_nsec3 = l_rr # Store so we have something to work with
       end
       # Check that the parameters are the same as those defined in the config
-      if (l_rr.salt != @config.denial.nsec3.hash.salt)
+      if (l_rr.salt.downcase != @config.denial.nsec3.hash.salt.downcase)
         log(LOG_ERR, "NSEC3 has wrong salt : should be #{@config.denial.nsec3.hash.salt} but was #{l_rr.salt}")
       end
       if (l_rr.iterations != @config.denial.nsec3.hash.iterations)
